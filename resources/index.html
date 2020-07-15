@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="ajax.js"></script>
+    <script src="https://cdn.rawgit.com/satazor/SparkMD5/master/spark-md5.min.js"></script>
+    <title>大文件上传</title>
+    <style>
+        
+    </style>
+</head>
+<body>
+
+    <input type="file" id="ipt"/>
+    <hr />
+    <h1>上传总进度</h1>
+    <div id="totalProgress">
+        <progress  value="0" max="100"></progress>
+        <span></span>
+    </div>
+    <hr />
+    <h1>所有切片的进度</h1>
+    <div id="chunkProgress">
+        
+    </div>
+    <script>
+        const ipt = document.getElementById('ipt');
+        const totalProgress = document.getElementById('totalProgress');
+        const chunkProgress = document.getElementById('chunkProgress');
+        let file;
+        let filehash; // 根据切片内容生成hash值
+        let chunkSize = 10*1024*1024; // 设置切片大小 默认10M
+        let fileChunkList = []; // 储存所有的切片
+        ipt.onchange = async function(e){
+            reset();
+            const [curfile] = e.target.files;
+            if(!curfile) return;
+            file = curfile;
+            let fromData = new FormData();
+            fromData.append('file',file);
+            createFileChunk(file,chunkSize);
+            filehash = await generatorHash();
+            let checkResult = await checkFile();
+            generatorChunkProgress();
+            if(checkResult){
+                // 直接提示上传成功 不需要走下面的上传切片  合并切片
+                calcTotalProgress(true);
+                fileChunkList.forEach((v,i)=> {
+                    setChunkProgress(i,100,100);
+                })
+                return;
+            }
+            // 上传切片
+            await uploadChunks();
+            // 等待切片上传完成 告诉服务器合并切片
+            await mergeRequest();
+            console.log('合并成功')
+        }
+        //将文件切片
+        function createFileChunk(file,size){
+            const fileSize = file.size; // 文件的大小
+            let curSize = 0; // 当前切片的总大小
+            while(curSize < fileSize){
+                let chunk = file.slice(curSize,curSize+size);
+                fileChunkList.push(chunk);
+                curSize+=size;
+            }
+            
+        }
+        //上传所有切片
+        function uploadChunks(){
+            fileChunkList = fileChunkList.map((chunk,index) => {
+                return {
+                    chunk, // 切片
+                    hash:`${filehash}-${index}`, // hash标识
+                    loaded:0, // 上传的大小
+                }
+            });
+            const requestList = fileChunkList.map(({chunk,hash},index) => {
+                const fromData = new FormData();
+                fromData.append('chunk',chunk);
+                fromData.append('hash',hash);
+                fromData.append('filehash',filehash);
+                fromData.append('filename',file.name);
+                console.log(chunk,hash)
+                return ajax({
+                    url:'http://192.168.100.40:3000/upload',
+                    methods:'post',
+                    data:fromData,
+                    onProgress:createProgress(index)
+                })
+            })
+            console.log(requestList)
+            return Promise.all(requestList);
+        }
+
+        // 告诉服务器需要合并切片
+        function mergeRequest(){
+            return ajax({
+                url:'http://localhost:3000/merge',
+                methods:'post',
+                data:JSON.stringify({
+                    hash:filehash,
+                    name:file.name,
+                    size:chunkSize
+                })
+            })
+        }
+        // 生成切片的上传进度
+        function createProgress(index){
+            let item = fileChunkList[index];
+            return function (e){
+                if(e.lengthComputable){
+                    let loaded = e.loaded; // 上传的大小
+                    let total = e.total; // 文件总大小
+                    item.loaded = loaded;
+                    // item.progress = loaded/total; // 上传的占比
+                    setChunkProgress(index,total,loaded);
+                    calcTotalProgress();
+                }
+            }
+        }
+        // 生成所有切片的进度条
+        function generatorChunkProgress(){
+            let html = '';
+            fileChunkList.forEach(v => {
+                html +=  '<p>'+
+                    '<progress value="0" max="100"></progress>'+
+                    '<span></span>'+
+                    '<em style="color:red"></em>'+
+                    '</p>';
+            });
+            chunkProgress.innerHTML = html;
+        }
+        // 设置切片的进度
+        function setChunkProgress(index,total,loaded,){
+            let childs = chunkProgress.querySelectorAll('p');
+            let el = childs[index];
+            let progressDom = el.querySelector('progress');
+            let perc = el.querySelector('span');
+            let sizeDom = el.querySelector('em');
+            progressDom.setAttribute('value',loaded);
+            progressDom.setAttribute('max',total);
+            perc.innerHTML = `${loaded/total*100}%`;
+            sizeDom.innerHTML = `文件大小：${total}kb`
+        }
+        // 计算总文件的上传进度  上传的所有切片的大小总和/文件的大小
+        function calcTotalProgress(check = false){
+            let uploadTotalSize = 0;
+            if(!check){
+                uploadTotalSize = fileChunkList.reduce((total,item) => {
+                    return total+=item.loaded;
+                },0);
+            }else{
+                uploadTotalSize = file.size;
+            }
+            console.log(check)
+            let progressDom = totalProgress.querySelector('progress');
+            let perc = totalProgress.querySelector('span');
+            progressDom.setAttribute('value',uploadTotalSize);
+            progressDom.setAttribute('max',file.size);
+            let p = uploadTotalSize/file.size>1?1:uploadTotalSize/file.size;
+            perc.innerHTML = `${p.toFixed(2)*100}%`;
+        }
+        //  根据切片内容生成hash
+        function generatorHash(){
+            let index = 0;
+            let len = fileChunkList.length;
+            const spark = new self.SparkMD5.ArrayBuffer();
+            return new Promise((resolve,reject) => {
+                loadNext(index,resolve)
+            })
+
+            function loadNext(idx,resolve){
+                if(idx >= len){
+                    resolve(spark.end());
+                    return;
+                }
+                const curChunk = fileChunkList[idx]
+                const reader = new FileReader();
+                reader.readAsArrayBuffer(curChunk);
+                reader.onload = function(e){
+                    spark.append(e.target.result);
+                    loadNext(++idx,resolve);
+                }
+            }
+        }
+        // 初始化进度条
+        function reset(){
+            // reset file
+            file = null;
+            fileChunkList = [];
+            // reset Progress dom
+            chunkProgress.innerHTML = '';
+            let progressDom = totalProgress.querySelector('progress');
+            let perc = totalProgress.querySelector('span');
+            progressDom.setAttribute('value',0);
+            progressDom.setAttribute('max',100);
+            perc.innerHTML = '';
+        }
+        // 上传文件前先检测该文件是否在服务器上存在
+        function checkFile(){
+            return ajax({
+                url:'http://localhost:3000/check',
+                methods:'post',
+                data:JSON.stringify({
+                    filename:file.name,
+                    filehash:filehash
+                })
+            })
+        }
+    </script>
+
+
+
+</body>
+</html>
